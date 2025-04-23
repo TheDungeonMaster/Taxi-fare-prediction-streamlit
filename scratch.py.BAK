@@ -1,0 +1,114 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from shapely.geometry import Point
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import mean_absolute_error, r2_score
+from xgboost import XGBRegressor
+import joblib
+
+st.set_page_config(layout="wide")
+st.title("🚕 NYC Taxi Fare Prediction App")
+
+@st.cache_data
+def load_shapefile():
+    zones = gpd.read_file("taxi_zones/taxi_zones.shp")
+    return zones[["LocationID", "geometry"]].to_crs("EPSG:4326")
+
+@st.cache_data
+def load_data():
+    df = pd.read_csv("sample.csv")
+    df = df.dropna(subset=['pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude'])
+    return df
+
+def map_location_to_zone(df, lon_col, lat_col, zones, zone_name):
+    coords = [Point(xy) for xy in zip(df[lon_col], df[lat_col])]
+    geo_df = gpd.GeoDataFrame(df.copy(), geometry=coords, crs="EPSG:4326")
+    joined = gpd.sjoin(geo_df, zones, how="left", predicate="within")
+    return joined["LocationID"].rename(zone_name)
+
+# Load data
+zones = load_shapefile()
+df = load_data()
+
+# Map to zones
+df["PULocationID"] = map_location_to_zone(df, "pickup_longitude", "pickup_latitude", zones, "PULocationID")
+df["DOLocationID"] = map_location_to_zone(df, "dropoff_longitude", "dropoff_latitude", zones, "DOLocationID")
+
+# Create feature columns
+df["PU_DO_pair"] = df["PULocationID"].astype(str) + "_" + df["DOLocationID"].astype(str)
+df["hour_bin"] = pd.to_datetime(df["pickup_datetime"]).dt.hour // 2
+
+# Sample and drop NaNs
+df_cleaned = df[["total_amount", "PU_DO_pair", "hour_bin"]].dropna()
+df_sample = df_cleaned.sample(n=300000, random_state=42)
+
+# Define features and target
+y = df_sample["total_amount"]
+X = df_sample.drop(columns=["total_amount"])
+
+# Encode categoricals
+for col in ["PU_DO_pair", "hour_bin"]:
+    le = LabelEncoder()
+    X[col] = le.fit_transform(X[col].astype(str))
+
+# Train/val/test split
+X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.2, random_state=42)
+
+# Drop remaining NaNs
+X_train = X_train.dropna()
+y_train = y_train.loc[X_train.index]
+
+# XGBoost & Grid Search
+param_grid = {
+    'n_estimators': [100],
+    'max_depth': [3, 5],
+    'learning_rate': [0.1],
+    'subsample': [0.8],
+    'colsample_bytree': [0.8]
+}
+xgb = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1)
+
+grid_search = GridSearchCV(
+    estimator=xgb,
+    param_grid=param_grid,
+    scoring='neg_mean_absolute_error',
+    cv=KFold(n_splits=3, shuffle=True, random_state=42),
+    verbose=1,
+    n_jobs=-1
+)
+grid_search.fit(X_train, y_train)
+
+st.subheader("📈 Model Evaluation")
+
+val_preds = grid_search.predict(X_val)
+test_preds = grid_search.predict(X_test)
+
+st.write(f"**Validation MAE:** {mean_absolute_error(y_val, val_preds):.2f}")
+st.write(f"**Validation R²:** {r2_score(y_val, val_preds):.4f}")
+st.write(f"**Test MAE:** {mean_absolute_error(y_test, test_preds):.2f}")
+st.write(f"**Test R²:** {r2_score(y_test, test_preds):.4f}")
+
+# Feature importance
+importance_df = pd.DataFrame({
+    "feature": X.columns,
+    "importance": grid_search.best_estimator_.feature_importances_
+}).sort_values(by="importance", ascending=False)
+
+st.subheader("📊 Feature Importances")
+st.dataframe(importance_df)
+
+plt.figure(figsize=(6, 3))
+plt.barh(importance_df["feature"], importance_df["importance"])
+plt.xlabel("Importance")
+plt.title("Feature Importance")
+st.pyplot(plt)
+
+# Save model
+joblib.dump(grid_search.best_estimator_, "xgb_taxi_model.pkl")
